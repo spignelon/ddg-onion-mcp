@@ -53,7 +53,9 @@ func run(args []string) error {
 		remoteTor    = fs.Bool("allow-remote-tor-proxy", false, "allow a non-loopback Tor proxy")
 		isolation    = fs.String("isolation", env("DDG_TOR_ISOLATION", "session"), "Tor circuit isolation: session or request")
 		ddgURL       = fs.String("ddg-url", env("DDG_URL", ddg.DefaultBaseURL), "DuckDuckGo Lite URL")
-		userAgent    = fs.String("user-agent", env("DDG_USER_AGENT", "ddg-onion-mcp/"+version), "User-Agent sent to DuckDuckGo and to fetched sites")
+		identity     = fs.String("identity", env("DDG_IDENTITY", "tor-browser"), "request headers to send: tor-browser (mirrors Tor Browser) or honest (names this program)")
+		identityFile = fs.String("identity-file", env("DDG_IDENTITY_FILE", ""), "JSON object of header overrides applied on top of the identity (refresh a stale Tor Browser version)")
+		userAgent    = fs.String("user-agent", env("DDG_USER_AGENT", ""), "override just the User-Agent header")
 		region       = fs.String("region", env("DDG_REGION", ""), "default search region, e.g. us-en")
 		safeSearch   = fs.String("safe-search", env("DDG_SAFE_SEARCH", ""), "default safe search: off, moderate or strict")
 		searchRPM    = fs.Int("search-rpm", 20, "search requests per minute (0 = unlimited)")
@@ -92,11 +94,15 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("--isolation must be session or request, got %q", *isolation)
 	}
+	profile, err := buildProfile(*identity, *identityFile, *userAgent)
+	if err != nil {
+		return err
+	}
 	client, err := torhttp.New(torhttp.Config{
 		ProxyAddr:        *torProxy,
 		AllowRemoteProxy: *remoteTor,
 		Isolation:        iso,
-		UserAgent:        *userAgent,
+		Profile:          profile,
 	})
 	if err != nil {
 		return err
@@ -114,6 +120,7 @@ func run(args []string) error {
 		}
 		logger.Info("Tor check passed", "proxy", *torProxy)
 	}
+	logger.Info("request identity", "profile", client.ProfileName())
 
 	srv := mcpserver.New(mcpserver.Config{
 		Version:           version,
@@ -146,6 +153,31 @@ func run(args []string) error {
 		})
 	}
 	return fmt.Errorf("--transport must be stdio or http, got %q", *transport)
+}
+
+// buildProfile resolves --identity, --identity-file and --user-agent.
+func buildProfile(identity, file, userAgent string) (torhttp.Profile, error) {
+	var p torhttp.Profile
+	switch identity {
+	case "tor-browser":
+		p = torhttp.TorBrowserProfile()
+	case "honest":
+		p = torhttp.HonestProfile("ddg-onion-mcp/" + version)
+	default:
+		return p, fmt.Errorf("--identity must be tor-browser or honest, got %q", identity)
+	}
+	var err error
+	if file != "" {
+		if p, err = p.OverrideFromFile(file); err != nil {
+			return p, err
+		}
+	}
+	if userAgent != "" {
+		if p, err = p.With(map[string]string{"User-Agent": userAgent}); err != nil {
+			return p, err
+		}
+	}
+	return p, nil
 }
 
 type httpConfig struct {

@@ -170,12 +170,23 @@ func (f *Fetcher) Get(ctx context.Context, rawURL string, opts extract.Options) 
 		return nil, err
 	}
 
+	var prev *url.URL
 	for hop := 0; ; hop++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, cur.String(), nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1")
+		// Identity headers (User-Agent, Accept, ...) come from the client's
+		// profile. The first request is like an address typed by the user;
+		// later ones are redirects.
+		site := "none"
+		if hop > 0 {
+			site = "cross-site"
+			if prev != nil && prev.Scheme == cur.Scheme && prev.Host == cur.Host {
+				site = "same-origin"
+			}
+		}
+		f.Client.Navigate(req, torhttp.Nav{Site: site})
 		resp, err := f.Client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("fetching %s over Tor: %w", cur.Host, err)
@@ -196,6 +207,7 @@ func (f *Fetcher) Get(ctx context.Context, rawURL string, opts extract.Options) 
 			if err != nil {
 				return nil, &BlockedError{"redirect to an invalid URL"}
 			}
+			prev = cur
 			cur, err = ValidateURL(next.String(), f.AllowOnion)
 			if err != nil {
 				return nil, fmt.Errorf("redirect target rejected: %w", err)

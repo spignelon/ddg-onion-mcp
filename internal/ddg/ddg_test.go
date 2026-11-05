@@ -260,3 +260,34 @@ func TestSearchValidatesInput(t *testing.T) {
 		t.Error("bad region accepted")
 	}
 }
+
+func TestSearchSendsBrowserFormSubmissionHeaders(t *testing.T) {
+	d := &ddgStandIn{}
+	srv := httptest.NewServer(d.handler(liteFixture))
+	defer srv.Close()
+	hc := torhttp.NewWithProfile(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+	}, torhttp.TorBrowserProfile())
+	c := &Client{HTTP: hc, BaseURL: "http://ddg.example.test/lite/", MaxPages: 1}
+	if _, err := c.Search(context.Background(), "golang", 3, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	h := d.hdrs[0]
+	for name, want := range map[string]string{
+		"User-Agent":     "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+		"Accept":         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Content-Type":   "application/x-www-form-urlencoded",
+		"Origin":         "http://ddg.example.test",
+		"Referer":        "http://ddg.example.test/lite/",
+		"Sec-Fetch-Site": "same-origin",
+		"Sec-Fetch-Mode": "navigate",
+		"Sec-Fetch-Dest": "document",
+		"Sec-Fetch-User": "?1",
+	} {
+		if h.Get(name) != want {
+			t.Errorf("%s = %q, want %q", name, h.Get(name), want)
+		}
+	}
+}

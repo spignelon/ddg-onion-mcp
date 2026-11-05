@@ -53,15 +53,18 @@ type Config struct {
 	// host may not be Tor, so this must be an explicit choice.
 	AllowRemoteProxy bool
 	Isolation        Isolation
-	UserAgent        string
-	DialTimeout      time.Duration // time to reach the SOCKS proxy (default 10s)
-	HeaderTimeout    time.Duration // time to first response byte (default 60s)
+	// Profile is the identity headers to send. If it has no headers, an
+	// honest profile using UserAgent is used.
+	Profile       Profile
+	UserAgent     string
+	DialTimeout   time.Duration // time to reach the SOCKS proxy (default 10s)
+	HeaderTimeout time.Duration // time to first response byte (default 60s)
 }
 
 // Client is an HTTP client that only connects through Tor.
 type Client struct {
-	hc *http.Client
-	ua string
+	hc      *http.Client
+	profile Profile
 }
 
 // ErrProxyUnavailable is returned when the SOCKS proxy cannot be reached.
@@ -86,16 +89,25 @@ func New(cfg Config) (*Client, error) {
 	if !sd.perRequest {
 		sd.session = randomToken()
 	}
-	return newClient(sd.dial, cfg.UserAgent, cfg.HeaderTimeout, cfg.Isolation == IsolateRequest), nil
+	profile := cfg.Profile
+	if len(profile.Headers) == 0 {
+		profile = HonestProfile(cfg.UserAgent)
+	}
+	return newClient(sd.dial, profile, cfg.HeaderTimeout, cfg.Isolation == IsolateRequest), nil
 }
 
 // NewWithDialer builds a Client around an arbitrary dial function. It exists
 // so tests can stand in for Tor; production code uses New.
 func NewWithDialer(dial DialFunc, userAgent string) *Client {
-	return newClient(dial, userAgent, 30*time.Second, false)
+	return newClient(dial, HonestProfile(userAgent), 30*time.Second, false)
 }
 
-func newClient(dial DialFunc, ua string, headerTimeout time.Duration, disableKeepAlives bool) *Client {
+// NewWithProfile is NewWithDialer with an explicit identity profile (tests).
+func NewWithProfile(dial DialFunc, p Profile) *Client {
+	return newClient(dial, p, 30*time.Second, false)
+}
+
+func newClient(dial DialFunc, profile Profile, headerTimeout time.Duration, disableKeepAlives bool) *Client {
 	tr := &http.Transport{
 		Proxy:                 nil, // never honour HTTP_PROXY & co.
 		DialContext:           dial,
@@ -108,7 +120,7 @@ func newClient(dial DialFunc, ua string, headerTimeout time.Duration, disableKee
 		DisableKeepAlives:     disableKeepAlives,
 	}
 	return &Client{
-		ua: ua,
+		profile: profile,
 		hc: &http.Client{
 			Transport: tr,
 			// Callers validate each redirect hop themselves.
@@ -122,10 +134,23 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.URL == nil || (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" {
 		return nil, fmt.Errorf("torhttp: unsupported URL %q", req.URL)
 	}
-	if req.Header.Get("User-Agent") == "" && c.ua != "" {
-		req.Header.Set("User-Agent", c.ua)
+	if req.Header == nil {
+		req.Header = http.Header{}
 	}
-	return c.hc.Do(req)
+	c.profile.apply(req.Header)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// Decode here only if the profile set Accept-Encoding: otherwise Go has
+	// already decompressed the body itself.
+	if !resp.Uncompressed {
+		if err := decodeResponse(resp); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+	}
+	return resp, nil
 }
 
 // CloseIdleConnections closes pooled connections.

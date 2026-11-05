@@ -160,7 +160,12 @@ func (c *Client) post(ctx context.Context, target *url.URL, form url.Values) ([]
 		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "text/html")
+	// A search is a form submission from DuckDuckGo's own Lite page.
+	c.HTTP.Navigate(req, torhttp.Nav{
+		Site:    "same-origin",
+		Origin:  target.Scheme + "://" + target.Host,
+		Referer: target.String(),
+	})
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("contacting DuckDuckGo over Tor: %w", err)

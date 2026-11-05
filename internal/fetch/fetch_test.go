@@ -279,3 +279,45 @@ func TestContextCancelStopsTheFetch(t *testing.T) {
 		t.Fatal("cancellation did not stop the fetch promptly")
 	}
 }
+
+func TestBrowserProfileMarksNavigationsAndRedirectHops(t *testing.T) {
+	var mu sync.Mutex
+	var sites []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sites = append(sites, r.Host+" "+r.Header.Get("Sec-Fetch-Site")+" mode="+r.Header.Get("Sec-Fetch-Mode")+" ref="+r.Header.Get("Referer"))
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/a":
+			http.Redirect(w, r, "/b", http.StatusFound) // same origin
+		case "/b":
+			http.Redirect(w, r, "http://other.example.test/c", http.StatusFound) // different origin
+		default:
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "done")
+		}
+	}))
+	defer srv.Close()
+	client := torhttp.NewWithProfile(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+	}, torhttp.TorBrowserProfile())
+	f := &Fetcher{Client: client, AllowOnion: true}
+	if _, err := f.Get(context.Background(), "http://first.example.test/a", extract.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{
+		"first.example.test none mode=navigate ref=",
+		"first.example.test same-origin mode=navigate ref=",
+		"other.example.test cross-site mode=navigate ref=",
+	}
+	if len(sites) != len(want) {
+		t.Fatalf("requests = %v", sites)
+	}
+	for i := range want {
+		if sites[i] != want[i] {
+			t.Errorf("request %d = %q, want %q", i, sites[i], want[i])
+		}
+	}
+}

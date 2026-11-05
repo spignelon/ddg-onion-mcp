@@ -254,3 +254,42 @@ func TestStartupFailsClosedWhenTorIsDown(t *testing.T) {
 		t.Fatalf("error = %v, want a startup Tor check failure", err)
 	}
 }
+
+func TestBuildProfile(t *testing.T) {
+	p, err := buildProfile("tor-browser", "", "")
+	if err != nil || p.Name != "tor-browser" || !p.Browser {
+		t.Fatalf("tor-browser: %+v, %v", p, err)
+	}
+	p, err = buildProfile("honest", "", "")
+	if err != nil || p.Name != "honest" || p.Browser || !strings.HasPrefix(p.Headers[0].Value, "ddg-onion-mcp/") {
+		t.Fatalf("honest: %+v, %v", p, err)
+	}
+	p, err = buildProfile("tor-browser", "", "custom-agent/1")
+	if err != nil || p.Headers[0].Value != "custom-agent/1" {
+		t.Fatalf("user-agent override: %+v, %v", p, err)
+	}
+	file := filepath.Join(t.TempDir(), "id.json")
+	if err := os.WriteFile(file, []byte(`{"User-Agent":"from-file/1","Accept-Language":"de-DE,de;q=0.5"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// --user-agent wins over the file, the file wins over the built-in profile.
+	p, err = buildProfile("tor-browser", file, "flag/2")
+	if err != nil || p.Headers[0].Value != "flag/2" {
+		t.Fatalf("precedence: %+v, %v", p, err)
+	}
+	found := false
+	for _, h := range p.Headers {
+		if h.Name == "Accept-Language" && h.Value == "de-DE,de;q=0.5" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("identity file override missing: %+v", p.Headers)
+	}
+	if _, err := buildProfile("firefox", "", ""); err == nil {
+		t.Error("unknown identity accepted")
+	}
+	if _, err := buildProfile("tor-browser", filepath.Join(t.TempDir(), "nope.json"), ""); err == nil {
+		t.Error("missing identity file accepted")
+	}
+}
