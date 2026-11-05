@@ -1,0 +1,31 @@
+# Run ddg-onion-mcp (with its own Tor) using Docker Compose:
+#
+#   export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
+#   docker compose up -d
+#
+# The MCP endpoint is http://127.0.0.1:8085/mcp, authenticated with
+# "Authorization: Bearer $DDG_MCP_AUTH_TOKEN".
+services:
+  ddg-onion-mcp:
+    image: ${DDG_IMAGE:-ghcr.io/spignelon/ddg-onion-mcp:latest}
+    container_name: ddg-onion-mcp
+    restart: unless-stopped
+    environment:
+      DDG_MCP_AUTH_TOKEN: "${DDG_MCP_AUTH_TOKEN:?set DDG_MCP_AUTH_TOKEN first (see the comment at the top of this file)}"
+    ports:
+      # Loopback only. Put a TLS reverse proxy in front for anything public.
+      - "127.0.0.1:8085:8085"
+    volumes:
+      # Keeps Tor's guard state between restarts (faster start, better anonymity).
+      - tor-data:/var/lib/tor
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 100
+
+volumes:
+  tor-data:

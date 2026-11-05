@@ -5,8 +5,10 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI client two too
 - **`search`**: web search through DuckDuckGo's **Lite onion service**.
 - **`fetch_content`**: download a web page and return its main content as clean Markdown or text.
 
-**All traffic goes through Tor.** There is no direct-connection fallback. Written in Go; a single
-~11 MB binary using **about 22 MB of RAM idle (25 MB peak** after fetching a 100k-character page).
+**All traffic goes through Tor.** There is no direct-connection fallback. Written in Go; the server
+is a single ~11 MB binary using **about 22 MB of RAM idle (25 MB peak** after fetching a
+100k-character page). A ready-made Docker image that bundles Tor is published at
+`ghcr.io/spignelon/ddg-onion-mcp`.
 
 Licensed under **GPL-3.0-or-later** (see `LICENSE`).
 
@@ -106,7 +108,55 @@ indistinguishable from a real Tor Browser, and a site that compares the two can 
 impersonation is included. If DuckDuckGo or a site challenges the client, the server reports it as
 an error: it does not retry under another identity and does not try to solve or bypass challenges.
 
-## Install and run
+## Run with Docker (recommended)
+
+The image bundles its own Tor daemon, so nothing else needs to be installed or running:
+
+```sh
+export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
+echo "$DDG_MCP_AUTH_TOKEN"        # keep this: your MCP client needs it as a bearer token
+
+docker run -d --name ddg-onion-mcp --restart unless-stopped \
+  -p 127.0.0.1:8085:8085 \
+  -e DDG_MCP_AUTH_TOKEN \
+  -v ddg-onion-tor:/var/lib/tor \
+  ghcr.io/spignelon/ddg-onion-mcp:latest
+```
+
+The MCP endpoint is `http://127.0.0.1:8085/mcp` with the header `Authorization: Bearer <token>`.
+The first start takes a few seconds to tens of seconds while Tor bootstraps (about 13 s in testing),
+so the container shows `health: starting` until it is ready. `-v ddg-onion-tor:/var/lib/tor` is
+optional; it keeps Tor's guard state between restarts.
+
+- **A token is required.** Without `DDG_MCP_AUTH_TOKEN` the container refuses to start (exit code
+  64, within a second). The port is published on loopback only; put a TLS reverse proxy in front
+  for anything public.
+- **Hardened variant:** add `--read-only --tmpfs /tmp --cap-drop ALL --security-opt
+  no-new-privileges:true --memory 256m --pids-limit 100`. This is how it was tested.
+- **Size and memory:** the amd64 image is about 52 MB. A running container uses about 70 MB
+  (`docker stats`; the Tor daemon is most of it, the server about 22 MB).
+- **Runs as an unprivileged user.** Tor listens on `127.0.0.1:9050` inside the container only.
+- **Options** are the flags and environment variables in the table below, for example
+  `... ghcr.io/spignelon/ddg-onion-mcp:latest --identity honest`. `TOR_BOOTSTRAP_TIMEOUT`
+  (seconds, default 180) bounds how long the entrypoint waits for Tor.
+- **Tags:** `latest` and `main` follow the main branch, `X.Y.Z` and `X.Y` follow version tags, and
+  `sha-<commit>` pins an exact build. Images are built for `linux/amd64` and `linux/arm64`; the
+  arm64 image is built by CI but has not been run by the author.
+- **Docker Compose:** `compose.yaml` in this repository does the same, hardened:
+  `export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24) && docker compose up -d`.
+- **Desktop MCP clients (stdio):** have the client run
+  `docker run -i --rm ghcr.io/spignelon/ddg-onion-mcp:latest --transport stdio`, e.g.
+
+  ```json
+  { "mcpServers": { "ddg-onion": { "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/spignelon/ddg-onion-mcp:latest", "--transport", "stdio"] } } }
+  ```
+
+  The client's startup timeout must cover Tor's bootstrap time.
+- **Update:** `docker pull ghcr.io/spignelon/ddg-onion-mcp:latest`, then recreate the container.
+- **Build it yourself:** `docker build -t ddg-onion-mcp .`
+
+## Build and run from source
 
 Requirements: Go 1.26+ to build, and a running Tor with its SOCKS port on `127.0.0.1:9050`
 (Debian/Ubuntu: `apt install tor`).
@@ -160,10 +210,21 @@ Tested: a DEEIX Chat container reached this server over the Docker host gateway
 Sync discovered both tools, both `active`, no error, with their schemas intact. **Not tested:** a
 tool call made from a real chat, since that needs a model and API key.
 
-**VPS caveat (observed on the target VPS earlier in this project):** containers there could not
-reach a service on the host's Docker bridge address (`EHOSTUNREACH`, host firewall rules). Either
-allow that traffic or run Tor and this server as containers on DEEIX's compose network. A ready
-Dockerfile/compose file is **not provided yet**.
+**Container to container (recommended).** Put DEEIX and this server on the same Docker network and
+use the container name as the host. No port needs publishing, so it also avoids host-firewall
+problems (on one Oracle Cloud Ubuntu VPS, containers could not reach a service on the host's
+Docker bridge address at all; they got `EHOSTUNREACH`):
+
+```sh
+docker network create mcp-net
+docker run -d --name ddg-onion-mcp --restart unless-stopped --network mcp-net \
+  -e DDG_MCP_AUTH_TOKEN -v ddg-onion-tor:/var/lib/tor ghcr.io/spignelon/ddg-onion-mcp:latest
+docker network connect mcp-net <your-deeix-container>
+# DEEIX admin console: URL  http://ddg-onion-mcp:8085/mcp   auth token  $DDG_MCP_AUTH_TOKEN
+```
+
+Tested this way: a DEEIX container and this image on one user-defined network, with the MCP server
+registered by container name, synced both tools (`active`, no error).
 
 A hardened systemd unit is in `deploy/ddg-onion-mcp.service`. Its syntax was checked with
 `systemd-analyze verify`, but it has **not been run on a real server**.

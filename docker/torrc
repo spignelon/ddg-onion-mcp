@@ -1,0 +1,12 @@
+# Minimal client-only Tor configuration for the ddg-onion-mcp container.
+# The SOCKS port is bound to loopback inside the container; nothing outside the
+# container can use it.
+DataDirectory /var/lib/tor
+SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+ClientOnly 1
+AvoidDiskWrites 1
+SafeLogging 1
+# Notices go to the container log, and to a file the entrypoint watches for
+# the "Bootstrapped 100%" line.
+Log notice stderr
+Log notice file /tmp/tor-notices.log

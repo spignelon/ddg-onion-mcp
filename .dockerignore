@@ -1,0 +1,10 @@
+.git
+.github
+test
+deploy
+docs
+*.md
+/ddg-onion-mcp
+*.test
+.env
+*.token

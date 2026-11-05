@@ -65,6 +65,8 @@ func run(args []string) error {
 		allowOnion   = fs.Bool("allow-onion-fetch", true, "let fetch_content read .onion sites")
 		skipTorCheck = fs.Bool("skip-tor-check", false, "do not verify Tor at startup")
 		verbose      = fs.Bool("verbose", false, "debug logging (stderr)")
+		checkConfig  = fs.Bool("check-config", false, "validate the configuration without starting anything, then exit")
+		healthcheck  = fs.Bool("healthcheck", false, "probe a running HTTP server and the Tor proxy, then exit (for Docker HEALTHCHECK)")
 		showVersion  = fs.Bool("version", false, "print the version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -73,6 +75,10 @@ func run(args []string) error {
 	if *showVersion {
 		fmt.Println("ddg-onion-mcp", version)
 		return nil
+	}
+
+	if *healthcheck {
+		return probe(*listen, *torProxy)
 	}
 
 	level := slog.LevelInfo
@@ -106,6 +112,20 @@ func run(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	if *checkConfig {
+		if *transport == "http" {
+			token, err := loadToken(*tokenFile)
+			if err != nil {
+				return err
+			}
+			if err := validateHTTP(*listen, token, *noAuth); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintln(os.Stderr, "configuration OK")
+		return nil
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -189,12 +209,8 @@ type httpConfig struct {
 }
 
 func serveHTTP(ctx context.Context, logger *slog.Logger, srv *mcp.Server, c httpConfig) error {
-	host, _, err := net.SplitHostPort(c.addr)
-	if err != nil {
-		return fmt.Errorf("invalid --listen %q: %w", c.addr, err)
-	}
-	if c.token == "" && !loopback(host) && !c.noAuth {
-		return errors.New("refusing to listen on a non-loopback address without a bearer token: set DDG_MCP_AUTH_TOKEN or --auth-token-file (or --insecure-no-auth)")
+	if err := validateHTTP(c.addr, c.token, c.noAuth); err != nil {
+		return err
 	}
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
@@ -225,6 +241,41 @@ func serveHTTP(ctx context.Context, logger *slog.Logger, srv *mcp.Server, c http
 		defer cancel()
 		return hs.Shutdown(sctx)
 	}
+}
+
+// validateHTTP rejects an HTTP listener that would be exposed without a token.
+func validateHTTP(addr, token string, noAuth bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid --listen %q: %w", addr, err)
+	}
+	if token == "" && !loopback(host) && !noAuth {
+		return errors.New("refusing to listen on a non-loopback address without a bearer token: set DDG_MCP_AUTH_TOKEN or --auth-token-file (or --insecure-no-auth)")
+	}
+	return nil
+}
+
+// probe checks that the local HTTP server answers /healthz and that the Tor
+// SOCKS port accepts connections. It sends nothing through Tor.
+func probe(listen, torProxy string) error {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", listen, err)
+	}
+	hc := &http.Client{Timeout: 3 * time.Second}
+	resp, err := hc.Get("http://" + net.JoinHostPort("127.0.0.1", port) + "/healthz")
+	if err != nil {
+		return fmt.Errorf("server not answering: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server health check returned HTTP %d", resp.StatusCode)
+	}
+	conn, err := net.DialTimeout("tcp", torProxy, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("Tor proxy not accepting connections: %w", err)
+	}
+	return conn.Close()
 }
 
 // bearerAuth requires "Authorization: Bearer <token>" when token is set.

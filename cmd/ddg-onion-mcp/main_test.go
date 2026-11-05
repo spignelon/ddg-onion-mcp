@@ -293,3 +293,81 @@ func TestBuildProfile(t *testing.T) {
 		t.Error("missing identity file accepted")
 	}
 }
+
+func TestCheckConfig(t *testing.T) {
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "")
+	t.Setenv("DDG_MCP_AUTH_TOKEN_FILE", "")
+	// Exposed without a token: rejected before anything starts.
+	if err := run([]string{"--check-config", "--transport", "http", "--listen", "0.0.0.0:8085"}); err == nil || !strings.Contains(err.Error(), "bearer token") {
+		t.Fatalf("error = %v, want a bearer-token refusal", err)
+	}
+	// Loopback needs no token; stdio never does.
+	for _, args := range [][]string{
+		{"--check-config", "--transport", "http", "--listen", "127.0.0.1:8085"},
+		{"--check-config", "--transport", "stdio"},
+		{"--check-config", "--transport", "http", "--listen", "0.0.0.0:8085", "--insecure-no-auth"},
+	} {
+		if err := run(args); err != nil {
+			t.Errorf("run(%v): %v", args, err)
+		}
+	}
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "a-long-enough-token-1234")
+	if err := run([]string{"--check-config", "--transport", "http", "--listen", "0.0.0.0:8085"}); err != nil {
+		t.Errorf("with token: %v", err)
+	}
+	// --check-config must not touch the network: Tor check is skipped.
+	if err := run([]string{"--check-config", "--tor-proxy", freeAddr(t)}); err != nil {
+		t.Errorf("check-config contacted Tor: %v", err)
+	}
+	// Bad settings are still caught.
+	if err := run([]string{"--check-config", "--identity", "chrome"}); err == nil {
+		t.Error("bad identity accepted")
+	}
+}
+
+func TestHealthcheck(t *testing.T) {
+	tor, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tor.Close()
+	go func() {
+		for {
+			c, err := tor.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	addr := freeAddr(t)
+	if err := run([]string{"--healthcheck", "--listen", addr, "--tor-proxy", tor.Addr().String()}); err == nil {
+		t.Fatal("healthcheck passed with no server running")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serveHTTP(ctx, slog.New(slog.DiscardHandler), testServer(), httpConfig{addr: addr, stateless: true})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := run([]string{"--healthcheck", "--listen", addr, "--tor-proxy", tor.Addr().String()}); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("healthcheck never passed: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Server up but Tor proxy down: unhealthy.
+	if err := run([]string{"--healthcheck", "--listen", addr, "--tor-proxy", freeAddr(t)}); err == nil {
+		t.Error("healthcheck passed with Tor proxy down")
+	}
+	// A wildcard listen address is probed on loopback.
+	_, port, _ := net.SplitHostPort(addr)
+	if err := run([]string{"--healthcheck", "--listen", "0.0.0.0:" + port, "--tor-proxy", tor.Addr().String()}); err != nil {
+		t.Errorf("wildcard listen address: %v", err)
+	}
+	cancel()
+	<-done
+}
