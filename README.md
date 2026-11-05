@@ -125,7 +125,9 @@ docker run -d --name ddg-onion-mcp --restart unless-stopped \
 
 The MCP endpoint is `http://127.0.0.1:8085/mcp` with the header `Authorization: Bearer <token>`.
 The first start takes a few seconds to tens of seconds while Tor bootstraps (about 13 s in testing),
-so the container shows `health: starting` until it is ready. `-v ddg-onion-tor:/var/lib/tor` is
+so the container shows `health: starting` until it is ready. The startup Tor check retries
+transient failures (up to 5 attempts) and still refuses to start if Tor is unreachable or reports
+that traffic is not leaving through Tor. `-v ddg-onion-tor:/var/lib/tor` is
 optional; it keeps Tor's guard state between restarts.
 
 - **A token is required.** Without `DDG_MCP_AUTH_TOKEN` the container refuses to start (exit code
@@ -243,7 +245,13 @@ A hardened systemd unit is in `deploy/ddg-onion-mcp.service`. Its syntax was che
 - **The result parser depends on DuckDuckGo Lite's markup.** It is unit-tested against a synthetic
   fixture modelled on that markup and was checked live on a few queries; a markup change can
   break it.
-- Tor is slow: expect 2–10 seconds per call. No PDFs or other binary content.
+- Tor is slow: expect 2–10 seconds per call. Onion services can be slow to reach, especially from
+  a freshly started Tor: when Tor cannot connect to a destination the request is retried on a
+  fresh circuit, up to 3 attempts of at most 45 s each (only failures before any request data was
+  sent are retried). In a stress test of 12 containers cold-started at once, 10 first searches
+  succeeded (two only after a retry, at about 48 s), one got DuckDuckGo's rate limit (`HTTP 202`)
+  and one failed after all attempts (135 s). Starting many fresh clients from one IP at once makes
+  DuckDuckGo rate-limit you. PDFs and other binary content cannot be read.
 - Not implemented compared with `nickclyde/duckduckgo-mcp-server`: `ref://` link shortening and
   `expand_link`, TLS-fingerprint impersonation backends (deliberately omitted: only HTTP headers are
   profiled), per-host fetch limits.

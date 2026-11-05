@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,6 +23,7 @@ import (
 	"github.com/spignelon/ddg-onion-mcp/internal/extract"
 	"github.com/spignelon/ddg-onion-mcp/internal/fetch"
 	"github.com/spignelon/ddg-onion-mcp/internal/mcpserver"
+	"github.com/spignelon/ddg-onion-mcp/internal/torhttp"
 )
 
 type okSearch struct{}
@@ -370,4 +373,54 @@ func TestHealthcheck(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+type scriptedChecker struct {
+	results []error
+	calls   int
+}
+
+func (s *scriptedChecker) Check(context.Context) error {
+	i := s.calls
+	s.calls++
+	if i < len(s.results) {
+		return s.results[i]
+	}
+	return s.results[len(s.results)-1]
+}
+
+func TestWaitForTor(t *testing.T) {
+	quiet := slog.New(slog.DiscardHandler)
+	glitch := errors.New(`Get "https://check.torproject.org/api/ip": EOF`)
+
+	// Transport glitches are retried until the check passes.
+	c := &scriptedChecker{results: []error{glitch, glitch, nil}}
+	if err := waitForTor(context.Background(), c, quiet, 5, time.Millisecond); err != nil || c.calls != 3 {
+		t.Fatalf("err=%v calls=%d, want success on the 3rd attempt", err, c.calls)
+	}
+
+	// It gives up after the configured number of attempts and reports the last error.
+	c = &scriptedChecker{results: []error{glitch}}
+	if err := waitForTor(context.Background(), c, quiet, 4, time.Millisecond); !errors.Is(err, glitch) || c.calls != 4 {
+		t.Fatalf("err=%v calls=%d, want the glitch after 4 attempts", err, c.calls)
+	}
+
+	// A definitive "not Tor" answer, or a dead proxy, is never retried.
+	for name, e := range map[string]error{
+		"not tor":    fmt.Errorf("check: %w", torhttp.ErrNotTor),
+		"proxy down": fmt.Errorf("%w at 127.0.0.1:9050", torhttp.ErrProxyUnavailable),
+	} {
+		c = &scriptedChecker{results: []error{e}}
+		if err := waitForTor(context.Background(), c, quiet, 5, time.Millisecond); err == nil || c.calls != 1 {
+			t.Errorf("%s: err=%v calls=%d, want an immediate failure", name, err, c.calls)
+		}
+	}
+
+	// Cancellation stops the retries.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c = &scriptedChecker{results: []error{glitch}}
+	if err := waitForTor(ctx, c, quiet, 5, time.Hour); err == nil || c.calls > 1 {
+		t.Errorf("cancelled: err=%v calls=%d", err, c.calls)
+	}
 }

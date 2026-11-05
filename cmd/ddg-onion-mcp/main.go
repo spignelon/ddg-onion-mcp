@@ -132,8 +132,8 @@ func run(args []string) error {
 	defer stop()
 
 	if !*skipTorCheck {
-		cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-		err := client.Check(cctx)
+		cctx, cancel := context.WithTimeout(ctx, 150*time.Second)
+		err := waitForTor(cctx, client, logger, 5, 2*time.Second)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("startup Tor check failed: %w (start Tor, or pass --skip-tor-check)", err)
@@ -173,6 +173,35 @@ func run(args []string) error {
 		})
 	}
 	return fmt.Errorf("--transport must be stdio or http, got %q", *transport)
+}
+
+// torChecker verifies that traffic leaves through Tor.
+type torChecker interface{ Check(context.Context) error }
+
+// waitForTor runs the startup Tor check, retrying transport failures (a fresh
+// Tor often hits a bad circuit on its first request). It never retries a
+// definitive "not Tor" answer or an unreachable proxy, and it never falls back
+// to anything: if every attempt fails the caller refuses to start.
+func waitForTor(ctx context.Context, c torChecker, logger *slog.Logger, attempts int, backoff time.Duration) error {
+	var err error
+	for i := 1; i <= attempts; i++ {
+		actx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		err = c.Check(actx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, torhttp.ErrNotTor) || errors.Is(err, torhttp.ErrProxyUnavailable) || ctx.Err() != nil || i == attempts {
+			return err
+		}
+		logger.Warn("Tor check failed, retrying", "attempt", i, "of", attempts, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff * time.Duration(i)):
+		}
+	}
+	return err
 }
 
 // buildProfile resolves --identity, --identity-file and --user-agent.

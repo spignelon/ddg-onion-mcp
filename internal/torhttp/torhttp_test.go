@@ -26,6 +26,14 @@ type fakeSOCKS struct {
 	hosts   []string
 	users   []string
 	headers []http.Header
+	bodies  []string
+
+	// failure injection
+	connects     int
+	failuresLeft int           // refuse this many CONNECTs
+	failCode     byte          // SOCKS reply code for refusals (6 = TTL expired)
+	hang         bool          // never answer a CONNECT
+	respondDelay time.Duration // wait before answering the HTTP request
 }
 
 func newFakeSOCKS(t *testing.T) *fakeSOCKS {
@@ -106,15 +114,34 @@ func (f *fakeSOCKS) handle(c net.Conn) {
 	f.hosts = append(f.hosts, host)
 	f.users = append(f.users, user)
 	f.mu.Unlock()
+	f.mu.Lock()
+	f.connects++
+	fail, hang, delay := f.failuresLeft > 0, f.hang, f.respondDelay
+	if fail {
+		f.failuresLeft--
+	}
+	code := f.failCode
+	f.mu.Unlock()
+	if hang {
+		io.Copy(io.Discard, c) // hold the connection open without replying
+		return
+	}
+	if fail {
+		c.Write([]byte{5, code, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 
 	hr, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
+	reqBody, _ := io.ReadAll(hr.Body)
 	f.mu.Lock()
 	f.headers = append(f.headers, hr.Header.Clone())
+	f.bodies = append(f.bodies, string(reqBody))
 	f.mu.Unlock()
+	time.Sleep(delay)
 	body := "tor says hi"
 	io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"+body)
 }
