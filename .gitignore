@@ -1,0 +1,6 @@
+/ddg-onion-mcp
+/dist/
+*.test
+*.out
+.env
+*.token

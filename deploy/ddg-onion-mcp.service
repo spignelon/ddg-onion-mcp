@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Example systemd unit. Its syntax was checked with `systemd-analyze verify`, but it has
+# NOT been run on a real server: adapt paths, and test it, before relying on it.
+#
+#   sudo install -m 0755 ddg-onion-mcp /usr/local/bin/
+#   sudo install -d -m 0750 /etc/ddg-onion-mcp
+#   echo "DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)" | sudo tee /etc/ddg-onion-mcp/env >/dev/null
+#   sudo chmod 0640 /etc/ddg-onion-mcp/env
+#   sudo cp ddg-onion-mcp.service /etc/systemd/system/ && sudo systemctl enable --now ddg-onion-mcp
+
+[Unit]
+Description=ddg-onion-mcp (DuckDuckGo search and page fetch over Tor, MCP server)
+After=network-online.target tor.service
+Wants=tor.service
+
+[Service]
+DynamicUser=yes
+EnvironmentFile=/etc/ddg-onion-mcp/env
+ExecStart=/usr/local/bin/ddg-onion-mcp --transport http --listen 127.0.0.1:8085
+Restart=on-failure
+RestartSec=5
+
+# Defence in depth for "Tor only": the kernel only lets this service talk to
+# loopback (Tor's SOCKS port) and private Docker ranges (inbound MCP clients).
+# Add your Docker bridge range here if it differs.
+IPAddressDeny=any
+IPAddressAllow=localhost 172.16.0.0/12
+
+MemoryMax=96M
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
