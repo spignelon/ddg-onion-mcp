@@ -1,18 +1,124 @@
-# ddg-onion-mcp
+<h1 align="center">ddg-onion-mcp</h1>
 
-An [MCP](https://modelcontextprotocol.io) server that gives an AI client two tools:
+An [MCP](https://modelcontextprotocol.io) server that gives an AI client web search and page
+reading, **entirely over Tor**: search goes through DuckDuckGo's **Lite onion service**, and pages
+are fetched and reduced to clean Markdown. There is no direct-connection fallback. Single Go
+binary, no external accounts or API keys.
 
-- **`search`**: web search through DuckDuckGo's **Lite onion service**.
-- **`fetch_content`**: download a web page and return its main content as clean Markdown or text.
+Lightweight: Docker image is **~12 MB**, container idles at **~20 MB RAM**.
 
-**All traffic goes through Tor.** There is no direct-connection fallback. Written in Go; the server
-is a single ~11 MB binary using **about 22 MB of RAM idle (25 MB peak** after fetching a
-100k-character page). A small Docker image (12 MB, no Tor inside) that uses the Tor you already
-run on the host is published at `ghcr.io/spignelon/ddg-onion-mcp`.
+> Same job as `nickclyde/duckduckgo-mcp-server` and the Brave Search MCP server, for people who
+> want the traffic to leave through Tor and the server to be tiny.
 
-Licensed under **GPL-3.0-or-later** (see `LICENSE`).
+---
 
-## Tools
+## ⚠️ Read before you deploy this
+
+- **Search queries are not private from your model provider.** Tor hides your IP from DuckDuckGo
+  and from the sites you fetch. The AI service that writes the queries (OpenRouter, OpenAI, ...)
+  still sees them.
+- **Tor does not make this indistinguishable from Tor Browser.** Only the HTTP request headers are
+  matched. The TLS and HTTP/2 fingerprints are still Go's, so a site that compares them can tell
+  (see [Request identity](#request-identity)).
+- **Fetched pages are untrusted input.** A page can contain text that tries to instruct your
+  model. Both tools are marked read-only and say so, but treat the output accordingly.
+- **No bot-detection bypass.** If DuckDuckGo or a site refuses or challenges the client, the server
+  reports an error. It does not retry under another identity and does not solve challenges.
+  Respect the terms of the sites you query.
+
+---
+
+## Quick start (Docker)
+
+The image does **not** contain Tor. It needs a **Tor service running on the host OS**, and uses its
+SOCKS proxy at `127.0.0.1:9050` (the default of the distribution packages). Install and start it
+first:
+
+| Distribution | Install and start |
+|---|---|
+| Debian / Ubuntu | `sudo apt install tor && sudo systemctl enable --now tor` |
+| Arch | `sudo pacman -S tor && sudo systemctl enable --now tor` |
+| Fedora | `sudo dnf install tor && sudo systemctl enable --now tor` |
+| openSUSE | `sudo zypper install tor && sudo systemctl enable --now tor` |
+
+Then check that it is listening: `ss -tln | grep 9050` should show `127.0.0.1:9050`. (The `tor`
+service name and port were confirmed on openSUSE Tumbleweed; the other rows are the standard
+package names and have not been run by the author.) Without this service the container refuses to
+start, see "No Tor, no fallback" below.
+
+Inside a normal container `127.0.0.1` is the container itself, so run it with **`--network host`**.
+No repo clone needed:
+
+```bash
+export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
+echo "$DDG_MCP_AUTH_TOKEN"        # keep this: your MCP client needs it as a bearer token
+
+docker run -d --name ddg-onion-mcp --restart unless-stopped \
+  --network host \
+  -e DDG_MCP_AUTH_TOKEN \
+  ghcr.io/spignelon/ddg-onion-mcp:latest
+```
+
+**Alternative: clone the repo and use `compose.yaml`** (hardened: read-only filesystem, all
+capabilities dropped, 128 MB memory cap):
+
+```bash
+git clone https://github.com/spignelon/ddg-onion-mcp.git && cd ddg-onion-mcp
+export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
+docker compose up -d
+```
+
+The MCP endpoint is `http://127.0.0.1:8085/mcp` with the header `Authorization: Bearer <token>`.
+With host networking nothing is published with `-p`: the server listens directly on the host's
+loopback (change it with `-e DDG_MCP_LISTEN=host:port`).
+
+**Desktop MCP clients (stdio):** have the client run the image itself:
+
+```json
+{ "mcpServers": { "ddg-onion": { "command": "docker",
+    "args": ["run", "-i", "--rm", "--network", "host", "ghcr.io/spignelon/ddg-onion-mcp:latest", "--transport", "stdio"] } } }
+```
+
+Update with `docker pull ghcr.io/spignelon/ddg-onion-mcp:latest` and recreate the container. Build
+it yourself with `docker build -t ddg-onion-mcp .`.
+
+### Docker notes
+
+- **A token is mandatory in the image**, even on loopback, because with host networking every
+  local process could otherwise reach the server. Without `DDG_MCP_AUTH_TOKEN` the container
+  refuses to start (exit code 64, immediately). `-e DDG_MCP_REQUIRE_AUTH=false` or
+  `--insecure-no-auth` disables the requirement.
+- **No Tor, no fallback.** If the proxy isn't reachable the server fails closed within a second and
+  says so; forgetting `--network host` produces exactly that error, with a hint. The startup check
+  retries transient failures but refuses to run if Tor reports that traffic is not leaving through
+  Tor.
+- **Hardened variant:** add `--read-only --cap-drop ALL --security-opt no-new-privileges:true
+  --memory 128m --pids-limit 64`. This is how it was tested; no volume or `/tmp` is needed. The
+  container runs as an unprivileged user (uid 65532).
+- **Options** are the flags and environment variables in the [table below](#flags-and-environment),
+  for example `... ghcr.io/spignelon/ddg-onion-mcp:latest --identity honest`. The health check reads
+  `DDG_MCP_LISTEN` and `DDG_TOR_PROXY` from the environment, so set those with `-e`, not as flags.
+- **A different Tor location.** To use a Tor proxy elsewhere (for example one bound to the Docker
+  bridge address, instead of `--network host`), set `-e DDG_TOR_PROXY=host:port` and pass
+  `--allow-remote-tor-proxy`; a proxy that is not on loopback may not be Tor, so this is an explicit
+  opt-in. This variant has not been tested.
+- **Tags:** `latest` and `main` follow the main branch, `X.Y.Z` and `X.Y` follow version tags, and
+  `sha-<commit>` pins an exact build. Images are built for `linux/amd64` and `linux/arm64`; the
+  arm64 image is built by CI but has not been run by the author. Older images that bundled their own
+  Tor (up to `sha-622bbc0`) are no longer what `latest` points to.
+- **Size and memory** (hardened container, measured): about 20 MiB resident at idle (11.6 MiB
+  charged to the container's cgroup), 23 MiB after a 100,000-character page, and 57 MiB peak after
+  fetching eight large pages at once with the rate limiter disabled. The Tor daemon on the host is
+  separate.
+
+## What it does
+
+Two tools, both read-only:
+
+| Tool | Use case |
+|---|---|
+| **`search`** | Web search through DuckDuckGo Lite's onion service. Returns titles, URLs and snippets. |
+| **`fetch_content`** | Downloads a page and returns its main content as Markdown or text, with paging for long pages. |
 
 ### `search`
 
@@ -24,8 +130,8 @@ Licensed under **GPL-3.0-or-later** (see `LICENSE`).
 | `safe_search` | string | `off`, `moderate` (default), `strict` |
 | `time_range` | string | `d`, `w`, `m`, `y` |
 
-Returns titles, URLs and snippets. Sponsored results are dropped and DuckDuckGo's redirect links
-are unwrapped to the real destination. The query is sent in a POST body, never in a URL.
+Sponsored results are dropped and DuckDuckGo's redirect links are unwrapped to the real
+destination. The query is sent in a POST body, never in a URL.
 
 ### `fetch_content`
 
@@ -43,7 +149,38 @@ If no article is found (forums, link lists) the whole page is converted minus na
 footers. `parse_mode=full` skips Readability. Fetched pages are cached for 5 minutes so paging
 through a long page downloads it once.
 
-Both tools are marked read-only and carry a warning that their output is untrusted web content.
+## Key features
+
+- **Tor only, verified.** Every connection goes through the Tor SOCKS5 proxy, host names are sent to
+  Tor unresolved (no local DNS), and the server refuses to start unless the Tor Project's check
+  service confirms traffic leaves through Tor. See [How "Tor only" is enforced](#how-tor-only-is-enforced).
+- **Tor Browser request headers** by default (Firefox 153 on Linux), with Brotli and Zstandard
+  decoding. See [Request identity](#request-identity).
+- **Circuit isolation:** one random SOCKS credential per process (default) or per connection.
+- **SSRF guard:** `fetch_content` refuses loopback, private, link-local and metadata addresses and
+  re-validates every redirect hop. `.onion` pages can be fetched.
+- **Two transports:** stdio for desktop clients, Streamable HTTP (stateless, bearer token,
+  `Origin` check, `GET /healthz`) for servers.
+- **Rate limits, caching, size caps** on everything, and logs that contain hosts and counts only,
+  never queries or URLs.
+- Works with [DEEIX Chat](#using-it-with-deeix-chat) and any client that speaks MCP.
+
+## Architecture, at a glance
+
+Go 1.26, the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk), and
+`golang.org/x/net` for the SOCKS5 dialer and HTML parsing. No cgo, so the Docker image is a
+`FROM scratch` image holding one static binary (about 11 MB) and the CA certificates; there is no
+shell and no Tor inside.
+
+```
+cmd/ddg-onion-mcp/       flags, transports, startup checks
+internal/torhttp/        Tor-only HTTP client: SOCKS5, retries, identity profile, decoders
+internal/ddg/            DuckDuckGo Lite search and result parser
+internal/fetch/          URL validation, redirect handling, page cache
+internal/extract/        Readability + Markdown conversion
+internal/mcpserver/      tool definitions
+internal/limits/         rate limiting
+```
 
 ## How "Tor only" is enforced
 
@@ -105,76 +242,14 @@ protocol or credential headers cannot be set from a file.
 **What this is not.** A profile only changes HTTP request headers. The TLS handshake, HTTP/2
 settings and header order still look like a Go program, not like Firefox, so traffic is *not*
 indistinguishable from a real Tor Browser, and a site that compares the two can tell. No TLS
-impersonation is included. If DuckDuckGo or a site challenges the client, the server reports it as
-an error: it does not retry under another identity and does not try to solve or bypass challenges.
-
-## Run with Docker (recommended)
-
-The image does **not** contain Tor. It connects to a Tor SOCKS proxy that you run, by default the
-host's `127.0.0.1:9050`. So first make sure Tor is running on the host (Debian/Ubuntu:
-`sudo apt install tor && sudo systemctl enable --now tor`; check with `ss -tln | grep 9050`).
-
-Inside a normal container `127.0.0.1` is the container itself, so run the image with
-**`--network host`**; then `127.0.0.1` is the host and the defaults just work:
-
-```sh
-export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
-echo "$DDG_MCP_AUTH_TOKEN"        # keep this: your MCP client needs it as a bearer token
-
-docker run -d --name ddg-onion-mcp --restart unless-stopped \
-  --network host \
-  -e DDG_MCP_AUTH_TOKEN \
-  ghcr.io/spignelon/ddg-onion-mcp:latest
-```
-
-The MCP endpoint is `http://127.0.0.1:8085/mcp` with the header `Authorization: Bearer <token>`.
-With host networking nothing is published with `-p`: the server listens directly on the host's
-loopback (change it with `-e DDG_MCP_LISTEN=host:port`).
-
-- **A token is mandatory in the image**, even on loopback, because with host networking every
-  local process could otherwise reach the server. Without `DDG_MCP_AUTH_TOKEN` the container
-  refuses to start (exit code 64, immediately). `-e DDG_MCP_REQUIRE_AUTH=false` or
-  `--insecure-no-auth` disables the requirement.
-- **No Tor, no fallback.** If the proxy isn't reachable the server fails closed within a second
-  and says so; forgetting `--network host` produces exactly that error, with a hint.
-  The startup check still retries transient failures but refuses to run if Tor reports that
-  traffic is not leaving through Tor.
-- **Hardened variant:** add `--read-only --cap-drop ALL --security-opt no-new-privileges:true
-  --memory 128m --pids-limit 64`. This is how it was tested; no volume or `/tmp` is needed.
-- **Size and memory:** the amd64 image is about 12 MB (the static binary and CA certificates, no
-  shell). Measured on a hardened container: about 20 MiB resident at idle (11.6 MiB charged to
-  the container's cgroup), 23 MiB after a 100,000-character page, and 57 MiB peak after fetching
-  eight large pages at once with the rate limiter disabled. The Tor daemon on the host is separate.
-- **Runs as an unprivileged user** (uid 65532).
-- **Options** are the flags and environment variables in the table below, for example
-  `... ghcr.io/spignelon/ddg-onion-mcp:latest --identity honest`. The health check reads
-  `DDG_MCP_LISTEN` and `DDG_TOR_PROXY` from the environment, so set those with `-e`, not as flags.
-- **A different Tor location.** To use a Tor proxy elsewhere (for example one bound to the Docker
-  bridge address, instead of `--network host`), set `-e DDG_TOR_PROXY=host:port` and pass
-  `--allow-remote-tor-proxy`; a proxy that is not on loopback may not be Tor, so this is an explicit
-  opt-in. This variant has not been tested.
-- **Tags:** `latest` and `main` follow the main branch, `X.Y.Z` and `X.Y` follow version tags, and
-  `sha-<commit>` pins an exact build. Images are built for `linux/amd64` and `linux/arm64`; the
-  arm64 image is built by CI but has not been run by the author.
-- **Docker Compose:** `compose.yaml` in this repository does the same, hardened:
-  `export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24) && docker compose up -d`.
-- **Desktop MCP clients (stdio):** have the client run
-  `docker run -i --rm --network host ghcr.io/spignelon/ddg-onion-mcp:latest --transport stdio`, e.g.
-
-  ```json
-  { "mcpServers": { "ddg-onion": { "command": "docker",
-      "args": ["run", "-i", "--rm", "--network", "host", "ghcr.io/spignelon/ddg-onion-mcp:latest", "--transport", "stdio"] } } }
-  ```
-
-- **Update:** `docker pull ghcr.io/spignelon/ddg-onion-mcp:latest`, then recreate the container.
-- **Build it yourself:** `docker build -t ddg-onion-mcp .`
+impersonation is included.
 
 ## Build and run from source
 
-Requirements: Go 1.26+ to build, and a running Tor with its SOCKS port on `127.0.0.1:9050`
-(Debian/Ubuntu: `apt install tor`).
+Requirements: Go 1.26+ to build, and a running Tor with its SOCKS port on `127.0.0.1:9050` (install
+and start it as in the [Quick start](#quick-start-docker) table).
 
-```sh
+```bash
 go build -trimpath -o ddg-onion-mcp ./cmd/ddg-onion-mcp
 
 ./ddg-onion-mcp                         # stdio, for desktop MCP clients
@@ -189,13 +264,17 @@ Stdio client config (Claude Desktop style):
 { "mcpServers": { "ddg-onion": { "command": "/path/to/ddg-onion-mcp" } } }
 ```
 
+A hardened systemd unit is in `deploy/ddg-onion-mcp.service`. Its syntax was checked with
+`systemd-analyze verify`, but it has **not been run on a real server**.
+
 ### Flags and environment
 
 | Flag | Env | Default |
 |---|---|---|
-| `--transport` | `DDG_MCP_TRANSPORT` | `stdio` (or `http`) |
+| `--transport` | `DDG_MCP_TRANSPORT` | `stdio` (or `http`; `http` in the image) |
 | `--listen` | `DDG_MCP_LISTEN` | `127.0.0.1:8085` |
 | `--auth-token-file` | `DDG_MCP_AUTH_TOKEN_FILE` | none; or set `DDG_MCP_AUTH_TOKEN` (min 16 chars) |
+| `--require-auth` | `DDG_MCP_REQUIRE_AUTH` | off; **on in the Docker image** |
 | `--allowed-origins` | `DDG_MCP_ALLOWED_ORIGINS` | none (loopback origins always allowed) |
 | `--tor-proxy` | `DDG_TOR_PROXY` | `127.0.0.1:9050` |
 | `--isolation` | `DDG_TOR_ISOLATION` | `session` |
@@ -207,27 +286,23 @@ Stdio client config (Claude Desktop style):
 | `--search-rpm`, `--fetch-rpm` | | 20 / 20 |
 | `--cache-ttl` | | 5m |
 | `--max-bytes` | | 2 MiB per download |
+| `--check-config`, `--healthcheck` | | validate configuration and exit; probe a running server |
 
 HTTP mode refuses to listen on a non-loopback address without a bearer token. The bearer check is
 constant-time, requests with a foreign `Origin` header are rejected, and sessions are stateless to
-keep memory low. `GET /healthz` returns `ok` without touching Tor. Logs go to stderr and contain
-hosts and counts only, never queries or URLs.
+keep memory low. `GET /healthz` returns `ok` without touching Tor. Configuration mistakes exit with
+code 64.
 
 ## Using it with DEEIX Chat
 
 DEEIX Chat accepts remote MCP servers over Streamable HTTP. In the admin console add an MCP server
 with the URL `http://<host>:8085/mcp` and the bearer token as its auth token, then run *Sync*.
 
-Tested: a DEEIX Chat container reached this server over the Docker host gateway
-(`host.docker.internal`, with the server listening on the `docker0` address and a bearer token).
-Sync discovered both tools, both `active`, no error, with their schemas intact. **Not tested:** a
-tool call made from a real chat, since that needs a model and API key.
-
 **DEEIX in a container, this server in a `--network host` container.** DEEIX (on an ordinary
 Docker network) cannot reach the host's loopback, so make the server listen on the Docker bridge
 address and let DEEIX reach it through the host gateway:
 
-```sh
+```bash
 BRIDGE=$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)     # usually 172.17.0.1
 docker run -d --name ddg-onion-mcp --restart unless-stopped --network host \
   -e DDG_MCP_AUTH_TOKEN -e DDG_MCP_LISTEN=$BRIDGE:8085 ghcr.io/spignelon/ddg-onion-mcp:latest
@@ -236,19 +311,18 @@ docker run -d --name ddg-onion-mcp --restart unless-stopped --network host \
 ```
 
 Tested this way: a DEEIX container and this image (host network, listening on the bridge address)
-synced both tools (`active`, no error). Some hosts firewall container-to-host traffic (on one
-Oracle Cloud Ubuntu VPS, containers could not reach a service on the host's Docker bridge address
-at all and got `EHOSTUNREACH`); there, allow the bridge to reach that port, or run the server and
-DEEIX both with host networking.
+synced both tools (`active`, no error, schemas intact). **Not tested:** a tool call made from a real
+chat, since that needs a model and API key.
 
-A hardened systemd unit is in `deploy/ddg-onion-mcp.service`. Its syntax was checked with
-`systemd-analyze verify`, but it has **not been run on a real server**.
+Some hosts firewall container-to-host traffic (on one Oracle Cloud Ubuntu VPS, containers could not
+reach a service on the host's Docker bridge address at all and got `EHOSTUNREACH`); there, allow the
+bridge to reach that port, or run the server and DEEIX both with host networking.
 
 ## Limitations (read these)
 
 - **No JavaScript.** Pages that build their content in the browser come back nearly empty. The
   tool flags this; try `parse_mode=full` or another source. A headless browser was ruled out for
-  RAM and Tor-speed reasons.
+  RAM and Tor-speed reasons. PDFs and other binary content cannot be read.
 - **DuckDuckGo may refuse automated clients.** It rejected a stock `curl` User-Agent with
   `406 Not Acceptable` (a controlled test showed the User-Agent alone decides it) while accepting
   both the honest `ddg-onion-mcp/...` identity and the Tor Browser profile. A refusal or challenge
@@ -258,23 +332,24 @@ A hardened systemd unit is in `deploy/ddg-onion-mcp.service`. Its syntax was che
 - **The result parser depends on DuckDuckGo Lite's markup.** It is unit-tested against a synthetic
   fixture modelled on that markup and was checked live on a few queries; a markup change can
   break it.
-- Tor is slow: expect 2–10 seconds per call. Onion services can be slow to reach, especially from
+- **Tor is slow:** expect 2–10 seconds per call. Onion services can be slow to reach, especially from
   a freshly started Tor: when Tor cannot connect to a destination the request is retried on a
   fresh circuit, up to 3 attempts of at most 45 s each (only failures before any request data was
-  sent are retried). In a stress test of an earlier image that bundled its own Tor (12 containers cold-started at once, each
-  bootstrapping a fresh Tor, which a long-running host Tor usually avoids), 10 first searches
-  succeeded (two only after a retry, at about 48 s), one got DuckDuckGo's rate limit (`HTTP 202`)
-  and one failed after all attempts (135 s). Starting many fresh clients from one IP at once makes
-  DuckDuckGo rate-limit you. PDFs and other binary content cannot be read.
+  sent are retried). In a stress test of an earlier image that bundled its own Tor (12 containers
+  cold-started at once, each bootstrapping a fresh Tor, which a long-running host Tor usually
+  avoids), 10 first searches succeeded (two only after a retry, at about 48 s), one got
+  DuckDuckGo's rate limit (`HTTP 202`) and one failed after all attempts (135 s). Starting many
+  fresh clients from one IP at once makes DuckDuckGo rate-limit you.
 - Not implemented compared with `nickclyde/duckduckgo-mcp-server`: `ref://` link shortening and
   `expand_link`, TLS-fingerprint impersonation backends (deliberately omitted: only HTTP headers are
   profiled), per-host fetch limits.
 
 ## Development
 
-```sh
+```bash
 go vet ./... && go test ./... -race
 go test -tags live ./test/live -v     # needs Tor on 127.0.0.1:9050 and network access
+test/docker-smoke.sh ddg-onion-mcp    # image checks; add --offline to skip the ones that need Tor
 ```
 
 `LIVE_WRAP` lets the live tests run the binary under an audit tool, for example
@@ -289,3 +364,9 @@ code was copied from either. Dependencies: the official
 [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) (MIT, transitioning to Apache-2.0),
 `go-readability` (MIT), `html-to-markdown` (MIT), `golang.org/x/net` (BSD-3-Clause),
 `andybalholm/brotli` (MIT) and `klauspost/compress` (BSD-3-Clause), all compatible with GPL-3.0.
+
+## License
+
+Licensed under the **GNU General Public License v3.0 or later** — see [`LICENSE`](LICENSE). Free to
+use, modify, and self-host, including commercially, provided derivative works you distribute stay
+under GPLv3 too. No warranty. Independent of the notes at the top — both apply.
