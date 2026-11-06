@@ -163,7 +163,7 @@ through a long page downloads it once.
   `Origin` check, `GET /healthz`) for servers.
 - **Rate limits, caching, size caps** on everything, and logs that contain hosts and counts only,
   never queries or URLs.
-- Works with [DEEIX Chat](#using-it-with-deeix-chat) and any client that speaks MCP.
+- Works with [Open WebUI, LibreChat and DEEIX Chat](#using-it-with-open-webui-librechat-and-deeix-chat), and any client that speaks MCP.
 
 ## Architecture, at a glance
 
@@ -293,30 +293,74 @@ constant-time, requests with a foreign `Origin` header are rejected, and session
 keep memory low. `GET /healthz` returns `ok` without touching Tor. Configuration mistakes exit with
 code 64.
 
-## Using it with DEEIX Chat
+## Using it with Open WebUI, LibreChat and DEEIX Chat
 
-DEEIX Chat accepts remote MCP servers over Streamable HTTP. In the admin console add an MCP server
-with the URL `http://<host>:8085/mcp` and the bearer token as its auth token, then run *Sync*.
+All three speak MCP over Streamable HTTP, so they use the same endpoint and bearer token:
+`http://<host>:8085/mcp` with `Authorization: Bearer <DDG_MCP_AUTH_TOKEN>`.
 
-**DEEIX in a container, this server in a `--network host` container.** DEEIX (on an ordinary
-Docker network) cannot reach the host's loopback, so make the server listen on the Docker bridge
-address and let DEEIX reach it through the host gateway:
+**Where the chat app runs decides `<host>`:**
 
-```bash
-BRIDGE=$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)     # usually 172.17.0.1
-docker run -d --name ddg-onion-mcp --restart unless-stopped --network host \
-  -e DDG_MCP_AUTH_TOKEN -e DDG_MCP_LISTEN=$BRIDGE:8085 ghcr.io/spignelon/ddg-onion-mcp:latest
-# DEEIX admin console: URL  http://host.docker.internal:8085/mcp   auth token  $DDG_MCP_AUTH_TOKEN
-# (the DEEIX container needs  --add-host host.docker.internal:host-gateway , as its compose file has)
+- **On the host itself** (not in Docker): use `127.0.0.1`. Nothing else to do.
+- **In a Docker container** (the usual case): the container cannot reach the host's loopback, so
+  start this server listening on the Docker bridge address and point the app at the host gateway:
+
+  ```bash
+  BRIDGE=$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)     # usually 172.17.0.1
+  docker run -d --name ddg-onion-mcp --restart unless-stopped --network host \
+    -e DDG_MCP_AUTH_TOKEN -e DDG_MCP_LISTEN=$BRIDGE:8085 ghcr.io/spignelon/ddg-onion-mcp:latest
+  ```
+
+  Then use `http://host.docker.internal:8085/mcp` in the app. On Linux the app's container needs
+  `extra_hosts: ["host.docker.internal:host-gateway"]` (or `--add-host
+  host.docker.internal:host-gateway`).
+
+Some hosts firewall container-to-host traffic (on one Oracle Cloud Ubuntu VPS, containers got
+`EHOSTUNREACH` for a service on the host's Docker bridge address); there, allow the bridge to reach
+port 8085, or run both with host networking.
+
+### DEEIX Chat
+
+Admin console → add an MCP server with the URL above and the token as its auth token → *Sync*.
+
+**Tested:** a DEEIX container reached this image over the host gateway and synced both tools
+(`active`, no error, schemas intact). **Not tested:** a tool call from a real chat, since that needs
+a model and API key.
+
+### Open WebUI
+
+Admin Settings → External Tools → add a server, type **MCP (Streamable HTTP)**, enter the URL,
+set authentication to **Bearer** and put the token in the **Key** field (leaving it empty sends an
+empty `Authorization` header). Save, then enable the tools for a chat. Only admins can add MCP
+servers.
+
+**Not tested** by the author: this follows the
+[Open WebUI MCP documentation](https://docs.openwebui.com/features/extensibility/mcp).
+
+### LibreChat
+
+Add the server to `librechat.yaml` and restart LibreChat:
+
+```yaml
+mcpServers:
+  ddg-onion:
+    type: streamable-http
+    url: http://host.docker.internal:8085/mcp
+    headers:
+      Authorization: "Bearer ${DDG_MCP_AUTH_TOKEN}"   # set DDG_MCP_AUTH_TOKEN in LibreChat's .env
+
+mcpSettings:
+  allowedAddresses:
+    - "host.docker.internal:8085"
 ```
 
-Tested this way: a DEEIX container and this image (host network, listening on the bridge address)
-synced both tools (`active`, no error, schemas intact). **Not tested:** a tool call made from a real
-chat, since that needs a model and API key.
+LibreChat blocks private and internal addresses for MCP servers by default, so a server on the host
+needs `allowedAddresses` (with the port). Leave `allowedDomains` unset: it is a strict whitelist and
+would block every public destination you do not list.
 
-Some hosts firewall container-to-host traffic (on one Oracle Cloud Ubuntu VPS, containers could not
-reach a service on the host's Docker bridge address at all and got `EHOSTUNREACH`); there, allow the
-bridge to reach that port, or run the server and DEEIX both with host networking.
+**Not tested** by the author: this follows the
+[LibreChat MCP server](https://www.librechat.ai/docs/configuration/librechat_yaml/object_structure/mcp_servers)
+and [MCP settings](https://www.librechat.ai/docs/configuration/librechat_yaml/object_structure/mcp_settings)
+documentation.
 
 ## Limitations (read these)
 
