@@ -1,5 +1,7 @@
-# Run ddg-onion-mcp (with its own Tor) using Docker Compose:
+# Run ddg-onion-mcp with Docker Compose. It uses the HOST's Tor, so Tor must be
+# running on the host with its SOCKS port on 127.0.0.1:9050 (the default):
 #
+#   sudo systemctl enable --now tor        # e.g. Debian/Ubuntu: apt install tor
 #   export DDG_MCP_AUTH_TOKEN=$(openssl rand -hex 24)
 #   docker compose up -d
 #
@@ -10,22 +12,15 @@ services:
     image: ${DDG_IMAGE:-ghcr.io/spignelon/ddg-onion-mcp:latest}
     container_name: ddg-onion-mcp
     restart: unless-stopped
+    # Host networking makes 127.0.0.1 inside the container the host's loopback,
+    # which is how it reaches the host's Tor. No ports are published.
+    network_mode: host
     environment:
       DDG_MCP_AUTH_TOKEN: "${DDG_MCP_AUTH_TOKEN:?set DDG_MCP_AUTH_TOKEN first (see the comment at the top of this file)}"
-    ports:
-      # Loopback only. Put a TLS reverse proxy in front for anything public.
-      - "127.0.0.1:8085:8085"
-    volumes:
-      # Keeps Tor's guard state between restarts (faster start, better anonymity).
-      - tor-data:/var/lib/tor
+      DDG_MCP_LISTEN: "${DDG_MCP_LISTEN:-127.0.0.1:8085}"
     read_only: true
-    tmpfs:
-      - /tmp
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    mem_limit: 256m
-    pids_limit: 100
-
-volumes:
-  tor-data:
+    mem_limit: 128m
+    pids_limit: 64

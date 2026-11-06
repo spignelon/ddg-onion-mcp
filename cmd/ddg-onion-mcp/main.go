@@ -33,11 +33,37 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
+// requireAuthDefault is the default for --require-auth. The Docker image sets
+// it to "true" at build time (-X main.requireAuthDefault=true); the
+// DDG_MCP_REQUIRE_AUTH environment variable overrides it either way.
+var requireAuthDefault = "false"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0) // usage was already printed
+		}
 		fmt.Fprintln(os.Stderr, "ddg-onion-mcp:", err)
+		var ce *configError
+		if errors.As(err, &ce) {
+			os.Exit(64) // EX_USAGE: the configuration is wrong
+		}
 		os.Exit(1)
 	}
+}
+
+// configError marks a mistake in the user's configuration (exit status 64), as
+// opposed to a runtime failure (exit status 1).
+type configError struct{ err error }
+
+func (e *configError) Error() string { return e.err.Error() }
+func (e *configError) Unwrap() error { return e.err }
+
+func cfgErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &configError{err}
 }
 
 func run(args []string) error {
@@ -46,7 +72,8 @@ func run(args []string) error {
 		transport    = fs.String("transport", env("DDG_MCP_TRANSPORT", "stdio"), "stdio or http (Streamable HTTP)")
 		listen       = fs.String("listen", env("DDG_MCP_LISTEN", "127.0.0.1:8085"), "HTTP listen address")
 		tokenFile    = fs.String("auth-token-file", env("DDG_MCP_AUTH_TOKEN_FILE", ""), "file holding the bearer token for HTTP (or set DDG_MCP_AUTH_TOKEN)")
-		noAuth       = fs.Bool("insecure-no-auth", false, "allow a non-loopback HTTP listener without a bearer token (not recommended)")
+		noAuth       = fs.Bool("insecure-no-auth", false, "allow HTTP without a bearer token even where one would be required (not recommended)")
+		requireAuth  = fs.Bool("require-auth", envBoolDefault("DDG_MCP_REQUIRE_AUTH", requireAuthDefault == "true"), "require a bearer token for HTTP even on a loopback address")
 		origins      = fs.String("allowed-origins", env("DDG_MCP_ALLOWED_ORIGINS", ""), "comma-separated extra Origin values allowed over HTTP (loopback always allowed)")
 		stateless    = fs.Bool("stateless", true, "stateless HTTP sessions (lower memory)")
 		torProxy     = fs.String("tor-proxy", env("DDG_TOR_PROXY", "127.0.0.1:9050"), "Tor SOCKS5 proxy address")
@@ -70,7 +97,10 @@ func run(args []string) error {
 		showVersion  = fs.Bool("version", false, "print the version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return cfgErr(err)
 	}
 	if *showVersion {
 		fmt.Println("ddg-onion-mcp", version)
@@ -89,7 +119,7 @@ func run(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	if *transport != "stdio" && *transport != "http" {
-		return fmt.Errorf("--transport must be stdio or http, got %q", *transport)
+		return cfgErr(fmt.Errorf("--transport must be stdio or http, got %q", *transport))
 	}
 
 	iso := torhttp.IsolateSession
@@ -98,11 +128,11 @@ func run(args []string) error {
 	case "request":
 		iso = torhttp.IsolateRequest
 	default:
-		return fmt.Errorf("--isolation must be session or request, got %q", *isolation)
+		return cfgErr(fmt.Errorf("--isolation must be session or request, got %q", *isolation))
 	}
 	profile, err := buildProfile(*identity, *identityFile, *userAgent)
 	if err != nil {
-		return err
+		return cfgErr(err)
 	}
 	client, err := torhttp.New(torhttp.Config{
 		ProxyAddr:        *torProxy,
@@ -111,19 +141,21 @@ func run(args []string) error {
 		Profile:          profile,
 	})
 	if err != nil {
-		return err
+		return cfgErr(err)
 	}
 
-	if *checkConfig {
-		if *transport == "http" {
-			token, err := loadToken(*tokenFile)
-			if err != nil {
-				return err
-			}
-			if err := validateHTTP(*listen, token, *noAuth); err != nil {
-				return err
-			}
+	// Validate the HTTP settings before anything slow (the Tor check) so that
+	// mistakes such as a missing token fail immediately.
+	var token string
+	if *transport == "http" {
+		if token, err = loadToken(*tokenFile); err != nil {
+			return cfgErr(err)
 		}
+		if err := validateHTTP(*listen, token, *noAuth, *requireAuth); err != nil {
+			return cfgErr(err)
+		}
+	}
+	if *checkConfig {
 		fmt.Fprintln(os.Stderr, "configuration OK")
 		return nil
 	}
@@ -136,7 +168,7 @@ func run(args []string) error {
 		err := waitForTor(cctx, client, logger, 5, 2*time.Second)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("startup Tor check failed: %w (start Tor, or pass --skip-tor-check)", err)
+			return fmt.Errorf("startup Tor check failed: %w\nIs Tor running and listening on %s? In Docker, 127.0.0.1 is the container itself: use --network host to reach the host's Tor (or pass --skip-tor-check)", err, *torProxy)
 		}
 		logger.Info("Tor check passed", "proxy", *torProxy)
 	}
@@ -163,12 +195,8 @@ func run(args []string) error {
 		}
 		return nil
 	case "http":
-		token, err := loadToken(*tokenFile)
-		if err != nil {
-			return err
-		}
 		return serveHTTP(ctx, logger, srv, httpConfig{
-			addr: *listen, token: token, noAuth: *noAuth,
+			addr: *listen, token: token, noAuth: *noAuth, requireAuth: *requireAuth,
 			origins: splitList(*origins), stateless: *stateless,
 		})
 	}
@@ -230,15 +258,16 @@ func buildProfile(identity, file, userAgent string) (torhttp.Profile, error) {
 }
 
 type httpConfig struct {
-	addr      string
-	token     string
-	noAuth    bool
-	origins   []string
-	stateless bool
+	addr        string
+	token       string
+	noAuth      bool
+	requireAuth bool
+	origins     []string
+	stateless   bool
 }
 
 func serveHTTP(ctx context.Context, logger *slog.Logger, srv *mcp.Server, c httpConfig) error {
-	if err := validateHTTP(c.addr, c.token, c.noAuth); err != nil {
+	if err := validateHTTP(c.addr, c.token, c.noAuth, c.requireAuth); err != nil {
 		return err
 	}
 
@@ -272,13 +301,22 @@ func serveHTTP(ctx context.Context, logger *slog.Logger, srv *mcp.Server, c http
 	}
 }
 
-// validateHTTP rejects an HTTP listener that would be exposed without a token.
-func validateHTTP(addr, token string, noAuth bool) error {
+// validateHTTP rejects an HTTP listener that would be reachable without a
+// token: any non-loopback address, or any address when require is set (the
+// Docker image sets it, because host networking exposes loopback to every
+// local process). noAuth is the explicit opt-out.
+func validateHTTP(addr, token string, noAuth, require bool) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid --listen %q: %w", addr, err)
 	}
-	if token == "" && !loopback(host) && !noAuth {
+	if token != "" || noAuth {
+		return nil
+	}
+	if require {
+		return errors.New("a bearer token is required: set DDG_MCP_AUTH_TOKEN or --auth-token-file (or --insecure-no-auth to disable the requirement)")
+	}
+	if !loopback(host) {
 		return errors.New("refusing to listen on a non-loopback address without a bearer token: set DDG_MCP_AUTH_TOKEN or --auth-token-file (or --insecure-no-auth)")
 	}
 	return nil
@@ -379,6 +417,18 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// envBoolDefault reads a boolean environment variable, returning def when it
+// is unset or not a recognised value.
+func envBoolDefault(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
 }
 
 func env(key, def string) string {

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -422,5 +423,85 @@ func TestWaitForTor(t *testing.T) {
 	c = &scriptedChecker{results: []error{glitch}}
 	if err := waitForTor(ctx, c, quiet, 5, time.Hour); err == nil || c.calls > 1 {
 		t.Errorf("cancelled: err=%v calls=%d", err, c.calls)
+	}
+}
+
+func TestRequireAuth(t *testing.T) {
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "")
+	t.Setenv("DDG_MCP_AUTH_TOKEN_FILE", "")
+	base := []string{"--check-config", "--transport", "http", "--listen", "127.0.0.1:8085"}
+
+	// Loopback needs no token by default, but does when auth is required.
+	if err := run(base); err != nil {
+		t.Fatalf("loopback without require-auth: %v", err)
+	}
+	err := run(append(base[:len(base):len(base)], "--require-auth"))
+	if err == nil || !strings.Contains(err.Error(), "token is required") {
+		t.Fatalf("loopback with --require-auth and no token: %v", err)
+	}
+	// The env var that the Docker image sets does the same.
+	t.Setenv("DDG_MCP_REQUIRE_AUTH", "true")
+	if err := run(base); err == nil {
+		t.Fatal("DDG_MCP_REQUIRE_AUTH=true was ignored")
+	}
+	// A token satisfies it; so does the explicit opt-out.
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "a-long-enough-token-1234")
+	if err := run(base); err != nil {
+		t.Fatalf("with token: %v", err)
+	}
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "")
+	if err := run(append(base[:len(base):len(base)], "--insecure-no-auth")); err != nil {
+		t.Fatalf("explicit opt-out: %v", err)
+	}
+	// stdio never needs a token.
+	if err := run([]string{"--check-config", "--transport", "stdio"}); err != nil {
+		t.Fatalf("stdio: %v", err)
+	}
+}
+
+func TestConfigurationMistakesAreTaggedForExitCode64(t *testing.T) {
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "")
+	t.Setenv("DDG_MCP_REQUIRE_AUTH", "true")
+	for name, args := range map[string][]string{
+		"missing token": {"--transport", "http"},
+		"bad transport": {"--transport", "carrier-pigeon"},
+		"bad isolation": {"--isolation", "sometimes"},
+		"bad identity":  {"--identity", "chrome"},
+		"remote proxy":  {"--tor-proxy", "203.0.113.9:9050"},
+		"unknown flag":  {"--no-such-flag"},
+		"short token":   {"--transport", "http"},
+	} {
+		if name == "short token" {
+			t.Setenv("DDG_MCP_AUTH_TOKEN", "short")
+		}
+		err := run(append(args, "--skip-tor-check"))
+		var ce *configError
+		if err == nil || !errors.As(err, &ce) {
+			t.Errorf("%s: error = %v (%T), want a *configError", name, err, err)
+		}
+	}
+	// A runtime failure (Tor down) is NOT a configuration error.
+	t.Setenv("DDG_MCP_AUTH_TOKEN", "a-long-enough-token-1234")
+	err := run([]string{"--transport", "http", "--listen", "127.0.0.1:0", "--tor-proxy", freeAddr(t)})
+	var ce *configError
+	if err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), "--network host") {
+		t.Errorf("Tor down: error = %v; want a plain runtime error that mentions --network host", err)
+	}
+	// -h is not an error.
+	if err := run([]string{"-h"}); !errors.Is(err, flag.ErrHelp) {
+		t.Errorf("-h: %v", err)
+	}
+}
+
+func TestEnvBoolDefault(t *testing.T) {
+	for val, want := range map[string]bool{"": true, "true": true, "1": true, "YES": true, "false": false, "0": false, "off": false, "garbage": true} {
+		t.Setenv("DDG_TEST_BOOL", val)
+		if got := envBoolDefault("DDG_TEST_BOOL", true); got != want {
+			t.Errorf("value %q with default true: got %v, want %v", val, got, want)
+		}
+	}
+	t.Setenv("DDG_TEST_BOOL", "")
+	if envBoolDefault("DDG_TEST_BOOL", false) {
+		t.Error("unset with default false returned true")
 	}
 }
