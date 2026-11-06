@@ -367,6 +367,4 @@ code was copied from either. Dependencies: the official
 
 ## License
 
-Licensed under the **GNU General Public License v3.0 or later** — see [`LICENSE`](LICENSE). Free to
-use, modify, and self-host, including commercially, provided derivative works you distribute stay
-under GPLv3 too. No warranty. Independent of the notes at the top — both apply.
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).
