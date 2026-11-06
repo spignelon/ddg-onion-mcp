@@ -355,15 +355,13 @@ test/docker-smoke.sh ddg-onion-mcp    # image checks; add --offline to skip the 
 `LIVE_WRAP` lets the live tests run the binary under an audit tool, for example
 `LIVE_WRAP="strace -f -qq -e trace=connect,sendto,sendmsg -o /tmp/trace.txt"`.
 
-## Credits and third-party licences
+## Credits
 
-The design (tool shape, paging, caching, rate limits, transport options) was informed by
-[nickclyde/duckduckgo-mcp-server](https://github.com/nickclyde/duckduckgo-mcp-server) and
-[brave/brave-search-mcp-server](https://github.com/brave/brave-search-mcp-server), both MIT. No
-code was copied from either. Dependencies: the official
-[MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) (MIT, transitioning to Apache-2.0),
-`go-readability` (MIT), `html-to-markdown` (MIT), `golang.org/x/net` (BSD-3-Clause),
-`andybalholm/brotli` (MIT) and `klauspost/compress` (BSD-3-Clause), all compatible with GPL-3.0.
+Design inspired by [nickclyde/duckduckgo-mcp-server](https://github.com/nickclyde/duckduckgo-mcp-server)
+and [brave/brave-search-mcp-server](https://github.com/brave/brave-search-mcp-server) (no code
+copied). Built on the [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk),
+[go-readability](https://codeberg.org/readeck/go-readability) and
+[html-to-markdown](https://github.com/JohannesKaufmann/html-to-markdown).
 
 ## License
 
