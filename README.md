@@ -120,7 +120,7 @@ Two tools, both read-only:
 | Tool | Use case |
 |---|---|
 | **`search`** | Web search through DuckDuckGo Lite's onion service. Returns titles, URLs and snippets. |
-| **`fetch_content`** | Downloads a page and returns its main content as Markdown or text, with paging for long pages. |
+| **`fetch_content`** | Downloads a page and returns its main content as Markdown or text. For long pages, `focus` returns the passages that answer a question instead of the first few thousand characters. |
 
 ### `search`
 
@@ -143,6 +143,7 @@ destination. The query is sent in a POST body, never in a URL.
 | `start_index` | integer | character offset, for paging long pages |
 | `max_length` | integer | 100–50000, default 8000 |
 | `parse_mode` | string | `markdown` (default), `text`, `full` |
+| `focus` | string | what you are looking for, as a question or keywords (up to 300 characters) |
 
 Extraction follows the recipe of the official MCP `fetch` server: Mozilla's **Readability**
 algorithm (the Go port from [Readeck](https://codeberg.org/readeck/go-readability)) finds the main
@@ -150,6 +151,25 @@ article, then [html-to-markdown](https://github.com/JohannesKaufmann/html-to-mar
 If no article is found (forums, link lists) the whole page is converted minus navigation and
 footers. `parse_mode=full` skips Readability. Fetched pages are cached for 5 minutes so paging
 through a long page downloads it once.
+
+**Long pages: `focus` and the section list.** A research paper or a long Wikipedia article is
+100,000 to 600,000 characters, and the page you want can sit far past the first 8,000. Two things
+help a model find it without paging through everything:
+
+- The first page of a long document ends with a **list of its sections** and the `start_index` of
+  each, so the model can jump straight to "Results".
+- With **`focus`** (for example `focus="itchy eyes odds ratio"`) the server splits the whole page
+  into paragraph-sized passages, ranks them against the question with BM25, and returns the best
+  ones in page order, each with its position and section, plus the section list. It is plain
+  keyword matching inside the server: no model, no embeddings, no extra download (it uses the
+  cached page). It needs temporary memory in proportion to the page: in a hardened container, focused calls on 400,000 to 600,000 character pages peaked at about 52 MiB resident (20 MiB at idle), including four at once. `max_length` caps how much comes back and
+  `start_index` is ignored. Numbers (`3.44`), mixed scripts and unspaced languages (Chinese,
+  Japanese, Thai) and words with combining marks (Hindi, Arabic) are handled.
+
+Links are cleaned up too: in-page anchors (`#ref12`), empty and `javascript:` links and links back
+to the page itself keep their text and lose the link, relative links are resolved against the full
+page URL, inline `data:` images and images without alt text are dropped, and `<` and `>` in the
+text come out as themselves instead of `&lt;` and `&gt;`.
 
 ## Key features
 
@@ -375,6 +395,11 @@ documentation.
   page is reported as an error; the server never retries under another identity. One `403` was
   seen from `example.com` over one Tor circuit during testing and did not recur in 16 further
   fetches (8 per identity, fresh circuits), so it could not be attributed to the identity.
+- **`focus` is keyword matching, not understanding.** It misses synonyms ("stomach" will not find
+  "gastrointestinal"), only knows simple English plurals, and when a decoy passage shares as many
+  of the question's rare words as the real answer, both come back. A passage can only be found if
+  the extractor kept it: content built by JavaScript, or dropped as page chrome, is not on the page
+  as far as the server is concerned. The model still has to choose to use it.
 - **The result parser depends on DuckDuckGo Lite's markup.** It is unit-tested against a synthetic
   fixture modelled on that markup and was checked live on a few queries; a markup change can
   break it.
