@@ -258,3 +258,103 @@ func TestRateLimiterIsConsultedOnCacheMissOnly(t *testing.T) {
 		t.Fatalf("fetch calls = %d", sf.calls.Load())
 	}
 }
+
+// structuredPage is a long page with headings and one passage that answers a
+// question buried far from the start.
+func structuredPage() *fetch.Page {
+	var b strings.Builder
+	b.WriteString("## Abstract\n\nWe surveyed participants during high and low pollution.\n\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("## Background " + string(rune('A'+i%26)) + "\n\nGeneral literature review about emissions, traffic and weather, with no health outcomes.\n\n")
+	}
+	b.WriteString("## Results\n\nHigh pollution was linked to itchy eyes (OR = 3.44, p < 0.001) and low mood.\n\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString("## Discussion " + string(rune('A'+i%26)) + "\n\nPolicy options, cost and enforcement in other cities.\n\n")
+	}
+	return &fetch.Page{URL: "https://journal.example/paper", Title: "A Paper", Text: b.String(), Method: "readability"}
+}
+
+func TestFetchFocusReturnsRelevantPassagesAndOutline(t *testing.T) {
+	sf := &stubFetch{page: structuredPage()}
+	cs := connect(t, Config{Search: &stubSearch{}, Fetch: sf, Cache: limits.NewCache[*fetch.Page](time.Minute, 8)})
+
+	out, isErr := call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "focus": "itchy eyes odds ratio"})
+	if isErr {
+		t.Fatalf("tool error: %s", out)
+	}
+	for _, want := range []string{
+		"Title: A Paper", "URL: https://journal.example/paper",
+		`passages for "itchy eyes odds ratio"`, "[at ", "section: Results", "itchy eyes (OR = 3.44",
+		"Sections (use start_index to jump)", "Abstract", "Results",
+		"characters total", "of ", " passages matched", "cache=miss",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("focused output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Showing characters") {
+		t.Errorf("focused output should not look like a plain page:\n%s", out)
+	}
+
+	// A second call with different words reuses the cached page.
+	out, _ = call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "focus": "policy cost enforcement"})
+	if !strings.Contains(out, "cache=hit") || sf.calls.Load() != 1 {
+		t.Errorf("focused read should hit the cache (fetcher calls = %d):\n%s", sf.calls.Load(), out)
+	}
+}
+
+func TestFetchFocusNoMatchSaysSoAndKeepsTheOutline(t *testing.T) {
+	cs := connect(t, Config{Search: &stubSearch{}, Fetch: &stubFetch{page: structuredPage()}})
+	out, isErr := call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "focus": "photosynthesis chloroplast"})
+	if isErr || !strings.Contains(out, "No passage") || !strings.Contains(out, "Sections (use start_index to jump)") {
+		t.Fatalf("isErr=%v\n%s", isErr, out)
+	}
+}
+
+func TestFetchFocusIsValidated(t *testing.T) {
+	sf := &stubFetch{page: structuredPage()}
+	cs := connect(t, Config{Search: &stubSearch{}, Fetch: sf})
+	if out, isErr := call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "focus": strings.Repeat("x ", 200)}); !isErr || !strings.Contains(out, "focus") {
+		t.Errorf("overlong focus accepted: isErr=%v %q", isErr, out)
+	}
+	if sf.calls.Load() != 0 {
+		t.Errorf("fetcher called %d times for invalid input", sf.calls.Load())
+	}
+	// start_index is not an error alongside focus; it is simply not used.
+	if out, isErr := call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "focus": "itchy eyes", "start_index": 500}); isErr || !strings.Contains(out, "itchy eyes (OR = 3.44") {
+		t.Errorf("focus with start_index: isErr=%v\n%s", isErr, out)
+	}
+}
+
+func TestFetchFirstPageOfLongStructuredPageGetsOutlineAndFocusHint(t *testing.T) {
+	cs := connect(t, Config{Search: &stubSearch{}, Fetch: &stubFetch{page: structuredPage()}})
+	out, _ := call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "max_length": 1000})
+	for _, want := range []string{"Sections (use start_index to jump)", "Results", `focus="`, "Showing characters 0-1000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("first page missing %q:\n%s", want, out[max(0, len(out)-900):])
+		}
+	}
+	// Continuation pages and short pages stay lean.
+	out, _ = call(t, cs, "fetch_content", map[string]any{"url": "https://journal.example/paper", "max_length": 1000, "start_index": 1000})
+	if strings.Contains(out, "Sections (use start_index") {
+		t.Errorf("outline repeated on a continuation page")
+	}
+	short := connect(t, Config{Search: &stubSearch{}, Fetch: &stubFetch{page: &fetch.Page{URL: "https://s.example/", Text: "## Hi\n\nshort page", Method: "readability"}}})
+	out, _ = call(t, short, "fetch_content", map[string]any{"url": "https://s.example/"})
+	if strings.Contains(out, "Sections (use start_index") || strings.Contains(out, `focus="`) {
+		t.Errorf("short page should have no outline or hint:\n%s", out)
+	}
+}
+
+func TestFetchToolDescriptionMentionsFocus(t *testing.T) {
+	cs := connect(t, Config{Search: &stubSearch{}, Fetch: &stubFetch{}})
+	tools, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range tools.Tools {
+		if tl.Name == "fetch_content" && !strings.Contains(tl.Description, "focus") {
+			t.Errorf("fetch_content description does not mention focus: %s", tl.Description)
+		}
+	}
+}

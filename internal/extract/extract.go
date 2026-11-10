@@ -103,11 +103,12 @@ func HTML(data []byte, o Options) (Result, error) {
 		return Result{}, fmt.Errorf("parsing HTML: %w", err)
 	}
 	title := docTitle(doc)
-	md, err := newConverter().ConvertNode(doc, converter.WithDomain(domainOf(base)))
+	cleanLinks(doc, base)
+	md, err := newConverter().ConvertNode(doc)
 	if err != nil {
 		return Result{}, fmt.Errorf("converting page to Markdown: %w", err)
 	}
-	return finish(Result{Title: title, Text: string(md), Method: "full-page"}, o.MaxChars), nil
+	return finish(Result{Title: title, Text: unescapeMarkdown(string(md)), Method: "full-page"}, o.MaxChars), nil
 }
 
 func viaReadability(data []byte, base *url.URL, mode Mode) (Result, bool) {
@@ -128,11 +129,12 @@ func viaReadability(data []byte, base *url.URL, mode Mode) (Result, bool) {
 		}
 		text = buf.String()
 	default:
-		md, err := newConverter().ConvertNode(art.Node, converter.WithDomain(domainOf(base)))
+		cleanLinks(art.Node, base)
+		md, err := newConverter().ConvertNode(art.Node)
 		if err != nil {
 			return Result{}, false
 		}
-		text = string(md)
+		text = unescapeMarkdown(string(md))
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(text)) < minArticleChars {
 		return Result{}, false
@@ -150,13 +152,6 @@ func newConverter() *converter.Converter {
 		conv.Register.TagType(tag, converter.TagTypeRemove, converter.PriorityStandard)
 	}
 	return conv
-}
-
-func domainOf(u *url.URL) string {
-	if u == nil || u.Host == "" {
-		return ""
-	}
-	return u.Scheme + "://" + u.Host
 }
 
 func finish(r Result, max int) Result {
