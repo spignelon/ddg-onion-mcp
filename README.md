@@ -98,6 +98,8 @@ it yourself with `docker build -t ddg-onion-mcp .`.
 - **Options** are the flags and environment variables in the [table below](#flags-and-environment),
   for example `... ghcr.io/spignelon/ddg-onion-mcp:latest --identity honest`. The health check reads
   `DDG_MCP_LISTEN` and `DDG_TOR_PROXY` from the environment, so set those with `-e`, not as flags.
+  It probes the address the server listens on (for example the Docker bridge address), or
+  `127.0.0.1` for a wildcard address such as `0.0.0.0`.
 - **A different Tor location.** To use a Tor proxy elsewhere (for example one bound to the Docker
   bridge address, instead of `--network host`), set `-e DDG_TOR_PROXY=host:port` and pass
   `--allow-remote-tor-proxy`; a proxy that is not on loopback may not be Tor, so this is an explicit

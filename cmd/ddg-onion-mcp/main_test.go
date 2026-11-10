@@ -376,6 +376,90 @@ func TestHealthcheck(t *testing.T) {
 	<-done
 }
 
+// The health check must probe the address the server is actually bound to,
+// not always 127.0.0.1 (issue #1: a server on the Docker bridge address was
+// reported unhealthy forever).
+func TestHealthcheckFollowsListenAddress(t *testing.T) {
+	tor, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tor.Close()
+	go func() {
+		for {
+			c, err := tor.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	for _, host := range []string{"127.0.0.2", "[::1]"} {
+		t.Run(host, func(t *testing.T) {
+			l, err := net.Listen("tcp", host+":0")
+			if err != nil {
+				t.Skipf("cannot bind %s: %v", host, err)
+			}
+			addr := l.Addr().String()
+			l.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				done <- serveHTTP(ctx, slog.New(slog.DiscardHandler), testServer(), httpConfig{addr: addr, stateless: true})
+			}()
+			defer func() { cancel(); <-done }()
+
+			args := []string{"--healthcheck", "--listen", addr, "--tor-proxy", tor.Addr().String()}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				err := run(args)
+				if err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("server on %s reported unhealthy: %v", addr, err)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			// Unhealthy when nothing listens on the address it is told about.
+			_, port, _ := net.SplitHostPort(addr)
+			other := net.JoinHostPort("127.0.0.3", port)
+			if host == "[::1]" {
+				other = net.JoinHostPort("::2", port)
+			}
+			if err := run([]string{"--healthcheck", "--listen", other, "--tor-proxy", tor.Addr().String()}); err == nil {
+				t.Errorf("healthcheck passed for %s where no server listens", other)
+			}
+		})
+	}
+
+	// Unspecified addresses (empty host, 0.0.0.0, ::) are probed on loopback.
+	addr := freeAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serveHTTP(ctx, slog.New(slog.DiscardHandler), testServer(), httpConfig{addr: addr, stateless: true})
+	}()
+	defer func() { cancel(); <-done }()
+	_, port, _ := net.SplitHostPort(addr)
+	deadline := time.Now().Add(5 * time.Second)
+	for _, listen := range []string{":" + port, "0.0.0.0:" + port, "[::]:" + port} {
+		for {
+			err := run([]string{"--healthcheck", "--listen", listen, "--tor-proxy", tor.Addr().String()})
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("--listen %s: %v", listen, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
 type scriptedChecker struct {
 	results []error
 	calls   int

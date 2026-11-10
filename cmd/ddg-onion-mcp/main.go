@@ -325,12 +325,18 @@ func validateHTTP(addr, token string, noAuth, require bool) error {
 // probe checks that the local HTTP server answers /healthz and that the Tor
 // SOCKS port accepts connections. It sends nothing through Tor.
 func probe(listen, torProxy string) error {
-	_, port, err := net.SplitHostPort(listen)
+	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", listen, err)
 	}
+	// Probe the address the server is bound to. A server on a specific address
+	// (loopback or, for example, the Docker bridge) does not answer on
+	// 127.0.0.1; only an unspecified address (empty, 0.0.0.0, ::) does.
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
 	hc := &http.Client{Timeout: 3 * time.Second}
-	resp, err := hc.Get("http://" + net.JoinHostPort("127.0.0.1", port) + "/healthz")
+	resp, err := hc.Get("http://" + net.JoinHostPort(host, port) + "/healthz")
 	if err != nil {
 		return fmt.Errorf("server not answering: %w", err)
 	}
